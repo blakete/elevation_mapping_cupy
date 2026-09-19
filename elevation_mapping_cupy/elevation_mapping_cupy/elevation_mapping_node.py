@@ -3,6 +3,8 @@ import math
 import message_filters
 import numpy as np
 from scipy import ndimage
+
+from elevation_mapping_cupy.planning_occupancy import make_planning_occupancy_grid
 import os
 from pathlib import Path
 from functools import partial
@@ -46,46 +48,8 @@ PDC_DATATYPE = {
 }
 
 
-def make_planning_occupancy_grid(data: np.ndarray, max_small_size: int = 2) -> np.ndarray:
-    """Build a planning-only occupancy grid from a raw OccupancyGrid `data` array.
-
-    The raw tri-state convention is FREE=0, UNKNOWN=-1, OCCUPIED=100. Small isolated
-    pockets of UNKNOWN are traversable holes a planner can route through, but a large
-    contiguous UNKNOWN region is a genuine gap in perception that MIGHTY's HGP/A* must
-    treat as blocked. This returns a COPY where every 8-connected UNKNOWN component of
-    size > max_small_size is set to OCCUPIED (100); components of size <= max_small_size
-    are left as UNKNOWN (-1). FREE/OCCUPIED cells are untouched.
-
-    Classification is recomputed from scratch on every call -- there is no history. If a
-    later map shrinks a large UNKNOWN region down to <= max_small_size connected cells,
-    those cells are simply left as -1 again on the next call.
-
-    Implemented as a single vectorized connected-components labeling
-    (scipy.ndimage.label, 8-connectivity) plus a per-label size count (np.bincount).
-    Both run in C, so a full 400x400 grid is classified in ~1 ms instead of the
-    hundreds of ms the previous pure-Python BFS took at 5 Hz -- the extra work used
-    to stall the mapping node whenever MIGHTY subscribed to the planning topic.
-    Result is identical to the flood-fill version. `data` itself is never mutated
-    (only the returned copy is written).
-    """
-    UNKNOWN = -1
-    OCCUPIED = 100
-
-    planning = data.copy()
-    # Label every 8-connected UNKNOWN component. Background (non-UNKNOWN) -> label 0.
-    structure = np.ones((3, 3), dtype=int)  # 8-connectivity
-    labels, num = ndimage.label(data == UNKNOWN, structure=structure)
-    if num == 0:
-        return planning  # no UNKNOWN cells at all
-    # sizes[k] = number of cells in component k (sizes[0] = background count).
-    sizes = np.bincount(labels.ravel())
-    is_large = sizes > max_small_size  # same threshold as before: > max_small_size
-    is_large[0] = False                # never block background / FREE / OCCUPIED cells
-    # is_large[labels] broadcasts the per-label decision back to the grid; only cells
-    # belonging to a large UNKNOWN component are flipped to OCCUPIED.
-    planning[is_large[labels]] = OCCUPIED
-
-    return planning
+# make_planning_occupancy_grid lives in planning_occupancy.py (pure numpy/scipy,
+# unit-tested in tests/test_planning_occupancy.py); imported below.
 
 
 def _pointcloud2_xyz_f32(msg: PointCloud2) -> np.ndarray:
@@ -284,6 +248,10 @@ class ElevationMappingNode(Node):
             # UNKNOWN components of <= this many 8-connected cells are traversable (left -1);
             # components of >= this + 1 (i.e. >= 5) are blocked as OCCUPIED for the planner.
             ('planning_unknown_max_traversable_cells', 4),
+            # UNKNOWN components touching the grid's outer edge are the boundary of what
+            # has been observed, not a perception gap: leave them -1 (MIGHTY prices unknown
+            # per step) instead of walling off the map edge. See planning_occupancy.py.
+            ('planning_unknown_exempt_border_components', True),
         ):
             if not self.has_parameter(name):
                 self.declare_parameter(name, default)
@@ -300,6 +268,7 @@ class ElevationMappingNode(Node):
         self.planning_occupancy_grid_enable = bool(self.get_parameter('planning_occupancy_grid_enable').value)
         self.planning_occupancy_grid_topic = self.get_parameter('planning_occupancy_grid_topic').get_parameter_value().string_value
         self.planning_unknown_max_traversable_cells = int(self.get_parameter('planning_unknown_max_traversable_cells').value)
+        self.planning_unknown_exempt_border_components = bool(self.get_parameter('planning_unknown_exempt_border_components').value)
         self.initialize_tf_grid_size = self.get_parameter('initialize_tf_grid_size').get_parameter_value().double_value
         self.map_acquire_fps = self.get_parameter('map_acquire_fps').get_parameter_value().double_value
         self.publish_statistics_fps = self.get_parameter('publish_statistics_fps').get_parameter_value().double_value
@@ -695,7 +664,9 @@ class ElevationMappingNode(Node):
         # every call, no persistence. `data` (the raw array) is never mutated.
         if planning_wanted:
             planning_data = make_planning_occupancy_grid(
-                data, self.planning_unknown_max_traversable_cells
+                data,
+                self.planning_unknown_max_traversable_cells,
+                self.planning_unknown_exempt_border_components,
             )
             planning_msg = OccupancyGrid()
             # Reuse the raw grid's header/info verbatim so the two outputs are byte-identical
