@@ -89,6 +89,12 @@ def launch_setup(context, *args, **kwargs):
     # frames/lidar); the node falls back to base_frame if this is empty/unavailable.
     params['sensor_frame'] = sensor_frame_id
     params['use_sim_time'] = use_sim_time.lower() in ('true', '1')
+    # Output topic names for the three 2D grids (defaults = the names MIGHTY reads).
+    # map_fusion_ros Stage B renames them to elev/* so the fusion node can own the
+    # canonical names: occupancy_grid_topic:=elev/occ_2d_topic etc. (see ~/mapping.sh).
+    params['occupancy_grid_topic'] = LaunchConfiguration('occupancy_grid_topic').perform(context)
+    params['planning_occupancy_grid_topic'] = LaunchConfiguration('planning_occupancy_grid_topic').perform(context)
+    params['esdf_grid_topic'] = LaunchConfiguration('esdf_grid_topic').perform(context)
 
     elevation_mapping_node = Node(
         package='elevation_mapping_cupy',
@@ -162,8 +168,24 @@ def generate_launch_description() -> LaunchDescription:
         'rviz_config', default_value='', description='Path to an RViz config file.',
     )
 
+    occupancy_grid_topic_arg = DeclareLaunchArgument(
+        'occupancy_grid_topic', default_value='occ_2d_topic',
+        description="Tri-state occupancy output, relative to the namespace (map_fusion Stage B: elev/occ_2d_topic).",
+    )
+    planning_occupancy_grid_topic_arg = DeclareLaunchArgument(
+        'planning_occupancy_grid_topic', default_value='planning_occ_2d_topic',
+        description="Planning occupancy output (map_fusion Stage B: elev/planning_occ_2d_topic).",
+    )
+    esdf_grid_topic_arg = DeclareLaunchArgument(
+        'esdf_grid_topic', default_value='esdf_2d_topic',
+        description="ESDF output (map_fusion Stage B: elev/esdf_2d_topic).",
+    )
+
     return LaunchDescription([
         quad_arg,
+        occupancy_grid_topic_arg,
+        planning_occupancy_grid_topic_arg,
+        esdf_grid_topic_arg,
         deskewed_topic_arg,
         map_frame_arg,
         base_frame_arg,
