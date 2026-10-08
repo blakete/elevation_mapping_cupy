@@ -227,12 +227,16 @@ occupancy:
     # proves too twitchy on noisy single-frame readings in practice, widen the gap between
     # minimum_confidence/maximum_confidence and the thresholds (and/or lower the increment/
     # decrement back below the full range) to require 2+ corroborating cycles again.
-    occupied_increment: 4.0
-    free_decrement: 4.0
+    # 2026-10-08 (static-world retune, map_fusion voxel map now carries dynamic obstacles):
+    # increment/decrement 2 with confidence in [-2, +4]: a cell turns lethal after TWO hazard
+    # readings (0.2-0.4 s at occupancy_grid_fps 5) instead of one; a just-latched cell clears
+    # after two free readings (0.4 s), a long-standing one after three (0.6 s).
+    occupied_increment: 2.0
+    free_decrement: 2.0
     occupied_threshold: 2.0
     free_threshold: -2.0
     minimum_confidence: -2.0
-    maximum_confidence: 2.0
+    maximum_confidence: 4.0
 
 esdf_metric:
   type: traversability_esdf
