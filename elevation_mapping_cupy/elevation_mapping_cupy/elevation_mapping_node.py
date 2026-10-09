@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import time
 import message_filters
 import numpy as np
 from scipy import ndimage
@@ -12,7 +13,7 @@ from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSPresetProfiles, QoSProfile, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from elevation_map_msgs.msg import ChannelInfo
@@ -28,6 +29,7 @@ from nav_msgs.msg import OccupancyGrid
 from grid_map_msgs.srv import SetGridMap, ProcessFile
 from geometry_msgs.msg import Vector3, Quaternion
 from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import String
 from std_msgs.msg import MultiArrayLayout as MAL
 from std_msgs.msg import MultiArrayDimension as MAD
 from std_srvs.srv import Trigger
@@ -145,6 +147,7 @@ class ElevationMappingNode(Node):
         self.register_timers()
         self.register_services()
         self._last_t = None
+        self.register_dlio_session_subscriber()
 
     def initialize_elevation_mapping(self) -> None:
         self.param.update()
@@ -891,6 +894,67 @@ class ElevationMappingNode(Node):
             response.message = str(exc)
             self.get_logger().error(f"clear_map failed: {exc}")
         return response
+
+    # ---------------------------------------------------------------- DLIO session reset
+    def register_dlio_session_subscriber(self) -> None:
+        """Clear the map whenever DLIO restarts.
+
+        DLIO re-seeds its odom frame on every start, so everything this map holds in
+        <ns>/odom is stale afterwards: move_to only shifts it to the new pose and the
+        occupancy latch never decays. dlio_ws's scripts/dlio_session.py publishes a
+        per-launch token on <ns>/dlio/session (1 Hz, reliable, volatile); the first token
+        is recorded, a new one clears the map. Not routed through the clear_map service,
+        whose name comes from service_namespace and is not per-robot. The TF buffer is
+        left alone: clearing it would also drop /tf_static, which rmw_zenoh does not
+        re-deliver to late joiners. An empty dlio_session_topic disables this.
+        """
+        for name, default in (("dlio_session_topic", "dlio/session"), ("dlio_session_late_first_s", 5.0)):
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+        topic = self.get_parameter("dlio_session_topic").get_parameter_value().string_value
+        self._dlio_session = None
+        self._dlio_sessions_seen = set()
+        self._dlio_session_late_s = float(self.get_parameter("dlio_session_late_first_s").value)
+        self._dlio_session_t0 = time.monotonic()
+        if not topic:
+            self.get_logger().info("dlio_session_topic is empty: the map is not reset on DLIO restarts")
+            return
+        qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                         reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+        self._dlio_session_sub = self.create_subscription(String, topic, self._on_dlio_session, qos)
+        self.get_logger().info(f"clearing the map when {self._dlio_session_sub.topic_name} changes (DLIO restart)")
+
+    def _on_dlio_session(self, msg) -> None:
+        token = msg.data
+        if token == self._dlio_session:
+            return
+        if token in self._dlio_sessions_seen:
+            self.get_logger().warning(f"DLIO session {token[:90]} was seen before; ignoring it "
+                                      "(two DLIO session publishers?)", throttle_duration_sec=10.0)
+            return
+        first = self._dlio_session is None
+        waited = time.monotonic() - self._dlio_session_t0
+        prev, self._dlio_session = self._dlio_session, token
+        self._dlio_sessions_seen.add(token)
+        if first and waited <= self._dlio_session_late_s:
+            self.get_logger().info(f"first DLIO session recorded: {token[:90]}")
+            return
+        why = (f"DLIO restarted (session {prev[:90]} -> {token[:90]})" if not first else
+               f"first DLIO session arrived {waited:.0f} s after this node started, so DLIO restarted "
+               f"while it ran (session {token[:90]})")
+        self.get_logger().warning(f"{why}: clearing the elevation map, the odom frame was re-seeded")
+        self._clear_map_now(why)
+
+    def _clear_map_now(self, reason: str) -> bool:
+        """What handle_clear_map does, callable from a subscription."""
+        try:
+            self._map.clear()
+            self._last_t = self.get_clock().now().to_msg()
+            self._republish_all_once()
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"clearing the elevation map failed ({reason}): {exc}")
+            return False
 
     def _grid_map_to_numpy(self, grid_map_msg: GridMap):
         if len(grid_map_msg.layers) != len(grid_map_msg.data):
