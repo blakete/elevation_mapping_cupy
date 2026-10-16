@@ -13,7 +13,7 @@ from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSPresetProfiles, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from elevation_map_msgs.msg import ChannelInfo
@@ -426,6 +426,12 @@ class ElevationMappingNode(Node):
         if any(config.get("data_type") == "image" for config in self.my_subscribers.values()):
             self.cv_bridge = CvBridge()
 
+        if not self.has_parameter('pointcloud_qos_depth'):
+            self.declare_parameter('pointcloud_qos_depth', 5)
+        pointcloud_qos_depth = int(self.get_parameter('pointcloud_qos_depth').value)
+        if pointcloud_qos_depth < 1:
+            raise ValueError(f"pointcloud_qos_depth must be >= 1, got {pointcloud_qos_depth}")
+
         for key, config in self.my_subscribers.items():
             data_type = config.get("data_type")
             if data_type == "image":
@@ -472,8 +478,16 @@ class ElevationMappingNode(Node):
             if not topic_name:
                 raise ValueError(f"Subscriber '{key}' is missing required key 'topic_name'.")
 
-            # Use sensor data QoS (BEST_EFFORT) for point clouds
-            qos_profile = QoSPresetProfiles.get_from_short_key("sensor_data")
+            # Sensor-data QoS (BEST_EFFORT, VOLATILE, KEEP_LAST) with a settable queue depth.
+            # The default 5 is the depth of the "sensor_data" preset this used before. 1 fuses only
+            # the newest cloud: with 5, a busy executor fuses clouds ~0.5 s old and the grids
+            # (stamped with the fused cloud) reach their consumers that much later (JK02 2026-10-15).
+            qos_profile = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=pointcloud_qos_depth,
+            )
             self._pointcloud_subs[key] = self.create_subscription(
                 PointCloud2,
                 topic_name,
