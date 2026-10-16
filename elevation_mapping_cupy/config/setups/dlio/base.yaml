@@ -46,6 +46,11 @@
     # newer (Turing/sm_75+ or later) hardware.
     use_chainer: false
 
+    # Point-cloud subscriber queue depth (node default 5 = the "sensor_data" QoS preset). 1 fuses
+    # only the newest cloud: a busy mapper otherwise fuses clouds ~0.5 s old and publishes grids
+    # that late (seen on JK02 2026-10-15). Overlays may change it per vehicle.
+    pointcloud_qos_depth: 1
+
     publishers:
       elevation_map_raw:
         layers: ['elevation', 'variance']

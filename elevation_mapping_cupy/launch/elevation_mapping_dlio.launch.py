@@ -19,17 +19,41 @@ same workaround already used in acl-mapping's global_mapper_travel.launch.py
 for travel_ros's equally absolute-keyed kitti_params.yaml -- see that file's
 comment for the original discovery (GroundGrid hit the identical issue with
 mid360.yaml).
+
+Parameter overlays (`param_overlays:=a.yaml,b.yaml`): deployment-owned YAML files applied in
+order on top of core_param.yaml + dlio/base.yaml (and the plugin configs) -- e.g. a vehicle-type
+file, then a single-vehicle file. Strict: an unknown key, a wrong type or a parameter this file
+computes from its arguments stops the launch. See param_overlays.py next to this file for the
+file format. `extra_cloud_topics:=t1,t2` (or an overlay's inputs.extra_clouds) fuses more
+PointCloud2 topics alongside the DLIO cloud; `extra_cloud_exclude:=a,b*` refuses topics the DLIO
+cloud already contains, so nothing is fused twice.
 """
 
+import importlib.util
 import os
+import tempfile
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+
+
+def _param_overlays_module():
+    """param_overlays.py from this launch file's directory, loaded by path: it needs only PyYAML,
+    and importing it through the elevation_mapping_cupy package would import cupy."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'param_overlays.py')
+    spec = importlib.util.spec_from_file_location('elevation_mapping_cupy_param_overlays', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _split(value: str) -> list:
+    return [v.strip() for v in value.split(',') if v.strip()]
 
 
 def _load_ros_parameters(yaml_path: str) -> dict:
@@ -62,15 +86,32 @@ def launch_setup(context, *args, **kwargs):
     traversability_param_path = os.path.join(
         share_dir, 'config', 'core', 'traversability_plugin_config.yaml')
 
+    plugin_param_path = os.path.join(share_dir, 'config', 'core', 'plugin_config.yaml')
+
     params = {}
     params.update(_load_ros_parameters(core_param_path))
     params.update(_load_ros_parameters(dlio_param_path))
+
+    # Layer 3: deployment overlays (vehicle type, then vehicle), applied in the order given.
+    po = _param_overlays_module()
+    overlay_paths = _split(LaunchConfiguration('param_overlays').perform(context))
+    base_extra_plugins = po.load_plugin_files([traversability_param_path])
+    result = po.apply_overlays(
+        params, po.load_plugin_files([plugin_param_path, traversability_param_path]), overlay_paths)
+    params = result.node_params
     # Geometric traversability pipeline (normals/slope/roughness/step/fusion/occupancy/ESDF),
     # loaded as a second plugin file merged on top of plugin_config.yaml -- see
     # parameter.py:extra_plugin_config_file and elevation_mapping.py's load_plugin_settings
     # call. Each stage still has its own enable:true/false in that file; this just makes the
-    # file itself available to load.
+    # file itself available to load. With plugin overlays the node gets a generated copy
+    # instead: this file's entries plus the full merged entry of every plugin an overlay changed.
     params['extra_plugin_config_file'] = traversability_param_path
+    if result.plugin_overrides:
+        fd, generated = tempfile.mkstemp(prefix=f"elevation_mapping_plugins_{quad or 'root'}_", suffix='.yaml')
+        os.close(fd)
+        params['extra_plugin_config_file'] = po.write_plugin_file(
+            base_extra_plugins, result.plugin_overrides, generated)
+    params['param_overlays_applied'] = result.applied_string()
 
     # Overrides -- see dlio/base.yaml's header comment for why these three
     # (topic/map_frame/base_frame) are placeholders in the file itself.
@@ -80,6 +121,14 @@ def launch_setup(context, *args, **kwargs):
             'data_type': 'pointcloud',
         }
     }
+    # Extra point clouds fused alongside the DLIO cloud (sensors DLIO does not ingest, e.g. a
+    # depth camera). Each is moved into the map frame through TF at its own stamp and is NOT
+    # motion-deskewed, so lidars belong in the merge before DLIO instead.
+    extra_topics = _split(LaunchConfiguration('extra_cloud_topics').perform(context))
+    extra_topics += [t for t in result.extra_clouds if t not in extra_topics]
+    params['subscribers'].update(po.extra_cloud_subscribers(
+        extra_topics, quad, deskewed_cloud_topic,
+        _split(LaunchConfiguration('extra_cloud_exclude').perform(context))))
     params['map_frame'] = map_frame_id
     params['base_frame'] = base_frame_id
     params['corrected_map_frame'] = map_frame_id
@@ -117,7 +166,13 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(launch_rviz),
     )
 
-    return [elevation_mapping_node, rviz_node]
+    log = [LogInfo(msg=line) for line in po.describe(result)]
+    for key, sub in params['subscribers'].items():
+        if key != 'dlio_cloud':
+            log.append(LogInfo(msg=f"extra cloud input {key}: {sub['topic_name']}"))
+    if result.plugin_overrides:
+        log.append(LogInfo(msg=f"plugin overlays -> {params['extra_plugin_config_file']}"))
+    return log + [elevation_mapping_node, rviz_node]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -188,8 +243,28 @@ def generate_launch_description() -> LaunchDescription:
                     "script is updated still feeds MIGHTY.",
     )
 
+    param_overlays_arg = DeclareLaunchArgument(
+        'param_overlays', default_value='',
+        description='Comma-separated parameter overlay YAML files applied in order over '
+                    'core_param.yaml + dlio/base.yaml (see param_overlays.py). Empty = none.',
+    )
+    extra_cloud_topics_arg = DeclareLaunchArgument(
+        'extra_cloud_topics', default_value='',
+        description='Comma-separated extra PointCloud2 topics fused alongside the DLIO cloud '
+                    '(added to any overlay inputs.extra_clouds). Not deskewed: for sensors DLIO '
+                    'does not ingest.',
+    )
+    extra_cloud_exclude_arg = DeclareLaunchArgument(
+        'extra_cloud_exclude', default_value='',
+        description="Comma-separated topics the DLIO cloud already contains; an entry ending in "
+                    "'*' is a prefix. Listing one as an extra cloud stops the launch.",
+    )
+
     return LaunchDescription([
         quad_arg,
+        param_overlays_arg,
+        extra_cloud_topics_arg,
+        extra_cloud_exclude_arg,
         occupancy_grid_topic_arg,
         planning_occupancy_grid_topic_arg,
         esdf_grid_topic_arg,
