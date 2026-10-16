@@ -68,6 +68,11 @@ if(BUILD_TESTING)
     TIMEOUT 120
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
+  ament_add_pytest_test(test_planning_occupancy
+    ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_planning_occupancy.py
+    TIMEOUT 120
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
   ament_add_pytest_test(test_parameter
     ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_parameter.py
     TIMEOUT 120
@@ -120,6 +125,16 @@ if(BUILD_TESTING)
   )
   ament_add_pytest_test(test_semantic_launch_descriptions
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_semantic_launch_descriptions.py
+    TIMEOUT 120
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
+  ament_add_pytest_test(test_traversability_pipeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_traversability_pipeline.py
+    TIMEOUT 120
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
+  ament_add_pytest_test(test_persistent_occupancy
+    ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_persistent_occupancy.py
     TIMEOUT 120
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )

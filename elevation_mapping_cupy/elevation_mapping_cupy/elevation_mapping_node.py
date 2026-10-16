@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import math
+import time
 import message_filters
 import numpy as np
+from scipy import ndimage
+
+from elevation_mapping_cupy.planning_occupancy import make_planning_occupancy_grid
 import os
 from pathlib import Path
 from functools import partial
@@ -9,7 +13,7 @@ from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSPresetProfiles, QoSProfile, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from elevation_map_msgs.msg import ChannelInfo
@@ -21,9 +25,11 @@ import tf2_py as tf2
 from rclpy.duration import Duration
 from rclpy.serialization import serialize_message, deserialize_message
 from grid_map_msgs.msg import GridMap
+from nav_msgs.msg import OccupancyGrid
 from grid_map_msgs.srv import SetGridMap, ProcessFile
 from geometry_msgs.msg import Vector3, Quaternion
 from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import String
 from std_msgs.msg import MultiArrayLayout as MAL
 from std_msgs.msg import MultiArrayDimension as MAD
 from std_srvs.srv import Trigger
@@ -42,6 +48,11 @@ PDC_DATATYPE = {
     "7": np.float32,
     "8": np.float64,
 }
+
+
+# make_planning_occupancy_grid lives in planning_occupancy.py (pure numpy/scipy,
+# unit-tested in tests/test_planning_occupancy.py); imported below.
+
 
 def _pointcloud2_xyz_f32(msg: PointCloud2) -> np.ndarray:
     """
@@ -132,14 +143,26 @@ class ElevationMappingNode(Node):
         self.initialize_elevation_mapping()
         self.register_subscribers()
         self.register_publishers()
+        self.register_occupancy_publishers()
         self.register_timers()
         self.register_services()
         self._last_t = None
+        self.register_dlio_session_subscriber()
 
     def initialize_elevation_mapping(self) -> None:
         self.param.update()
         self._pointcloud_process_counter = 0
         self._image_process_counter = 0
+        # TEMPORARY diagnostic instrumentation -- measuring live where real time actually goes
+        # (fusion vs. occupancy-chain vs. callback-to-callback gap) to find the ~1.6-1.8Hz vs
+        # 5Hz-configured bottleneck reported earlier. Remove once root-caused.
+        import time as _time
+        self._diag_time = _time
+        self._diag_pc_fusion_times = []
+        self._diag_pc_last_arrival = None
+        self._diag_pc_gaps = []
+        self._diag_occ_times = []
+        self._diag_log_every = 20
         self._map = ElevationMap(self.param)
         self._map_data = np.zeros(
             (self._map.cell_n - 2, self._map.cell_n - 2), dtype=np.float32
@@ -163,6 +186,17 @@ class ElevationMappingNode(Node):
         self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
         self.corrected_map_frame = self.get_parameter('corrected_map_frame').get_parameter_value().string_value
+        # Frame whose position is treated as the SENSOR origin when the incoming cloud is
+        # already expressed in the map frame (e.g. DLIO's deskewed-in-odom cloud). This drives
+        # the per-point noise model, the is_valid distance/height gate, and the visibility
+        # ray-cast origin -- see pointcloud_callback. Empty (default) -> fall back to
+        # base_frame. Set to the actual lidar frame (e.g. '<ns>/lidar') for the most correct
+        # range-from-sensor and height-above-sensor behaviour (the height gate is tight:
+        # max_height_range=0.5m, so the lidar's mount height above base_link matters). Does
+        # NOT affect where points land -- positions are invariant to this choice.
+        if not self.has_parameter('sensor_frame'):
+            self.declare_parameter('sensor_frame', '')
+        self.sensor_frame = self.get_parameter('sensor_frame').get_parameter_value().string_value
         self.initialize_method = self.get_parameter('initialize_method').get_parameter_value().string_value
         self.position_lowpass_alpha = self.get_parameter('position_lowpass_alpha').get_parameter_value().double_value
         self.orientation_lowpass_alpha = self.get_parameter('orientation_lowpass_alpha').get_parameter_value().double_value
@@ -175,6 +209,69 @@ class ElevationMappingNode(Node):
         self.cupy_memory_pool_trim_interval_s = float(
             self.get_parameter('cupy_memory_pool_trim_interval_s').value
         )
+        # Tri-state occupancy grid and ESDF outputs for Mighty (traversability_occupancy /
+        # traversability_esdf plugins). Off by default's not needed here -- the plugins
+        # themselves only run if enabled in a loaded plugin config file (see
+        # extra_plugin_config_file); these publishers just no-op (KeyError caught, skipped)
+        # if their source layer was never computed. enable flags let you turn off the
+        # publishers specifically even if the layers happen to be computed for other reasons.
+        for name, default in (
+            # 'occ_2d_topic' matches Mighty's existing subscription (mighty_node.cpp:
+            # sub_occ_2d_, "binary 2D occupancy for A* planning"), the same topic name
+            # global_mapper_ros's occ_2d_pub_ already publishes. Publishing as a plain
+            # relative name (see occupancy_grid_root_relative below) lets ROS2's own
+            # namespace prefixing land it on the exact same resolved topic Mighty already
+            # listens to -- no Mighty-side changes needed. NOTE: if global_mapper_ros is
+            # also running and publishing occ_2d_topic, you now have two publishers on one
+            # topic (same failure mode as the duplicate-DLIO issue) -- only run one source
+            # of occ_2d_topic at a time.
+            ('occupancy_grid_topic', 'occ_2d_topic'),
+            ('occupancy_grid_root_relative', True),
+            ('occupancy_grid_layer', 'occupancy'),
+            ('occupancy_grid_fps', 5.0),
+            ('occupancy_grid_enable', True),
+            # 'esdf_2d_topic' matches Mighty's existing subscription (mighty_node.cpp:
+            # sub_esdf_2d_, logged as "ESDF: Subscribed to esdf_2d_topic (d_safe=...)").
+            # Same root-relative reasoning as occ_2d_topic above -- NOTE: if global_mapper_ros
+            # or another source also publishes esdf_2d_topic, only run one at a time.
+            ('esdf_grid_topic', 'esdf_2d_topic'),
+            ('esdf_grid_root_relative', True),
+            ('esdf_grid_layer', 'esdf_encoded'),
+            ('esdf_grid_fps', 5.0),
+            ('esdf_grid_enable', True),
+            # Second occupancy output for MIGHTY's HGP/A* planner. Derived from the EXACT
+            # same occupancy update as occ_2d_topic (same stamp/frame/resolution/size/origin),
+            # then large (>= planning_unknown_max_traversable_cells + 1, 8-connected) UNKNOWN
+            # regions are turned into OCCUPIED so the planner treats perception gaps as blocked.
+            # The raw occ_2d_topic (frontier detection) is left byte-for-byte unchanged.
+            # Same relative-name / namespace behavior as occ_2d_topic -> resolves to e.g.
+            # /RR08/planning_occ_2d_topic (no hard-coded namespace).
+            ('planning_occupancy_grid_enable', True),
+            ('planning_occupancy_grid_topic', 'planning_occ_2d_topic'),
+            # UNKNOWN components of <= this many 8-connected cells are traversable (left -1);
+            # components of >= this + 1 (i.e. >= 5) are blocked as OCCUPIED for the planner.
+            ('planning_unknown_max_traversable_cells', 4),
+            # UNKNOWN components touching the grid's outer edge are the boundary of what
+            # has been observed, not a perception gap: leave them -1 (MIGHTY prices unknown
+            # per step) instead of walling off the map edge. See planning_occupancy.py.
+            ('planning_unknown_exempt_border_components', True),
+        ):
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+        self.occupancy_grid_topic = self.get_parameter('occupancy_grid_topic').get_parameter_value().string_value
+        self.occupancy_grid_root_relative = bool(self.get_parameter('occupancy_grid_root_relative').value)
+        self.occupancy_grid_layer = self.get_parameter('occupancy_grid_layer').get_parameter_value().string_value
+        self.occupancy_grid_fps = float(self.get_parameter('occupancy_grid_fps').value)
+        self.occupancy_grid_enable = bool(self.get_parameter('occupancy_grid_enable').value)
+        self.esdf_grid_topic = self.get_parameter('esdf_grid_topic').get_parameter_value().string_value
+        self.esdf_grid_root_relative = bool(self.get_parameter('esdf_grid_root_relative').value)
+        self.esdf_grid_layer = self.get_parameter('esdf_grid_layer').get_parameter_value().string_value
+        self.esdf_grid_fps = float(self.get_parameter('esdf_grid_fps').value)
+        self.esdf_grid_enable = bool(self.get_parameter('esdf_grid_enable').value)
+        self.planning_occupancy_grid_enable = bool(self.get_parameter('planning_occupancy_grid_enable').value)
+        self.planning_occupancy_grid_topic = self.get_parameter('planning_occupancy_grid_topic').get_parameter_value().string_value
+        self.planning_unknown_max_traversable_cells = int(self.get_parameter('planning_unknown_max_traversable_cells').value)
+        self.planning_unknown_exempt_border_components = bool(self.get_parameter('planning_unknown_exempt_border_components').value)
         self.initialize_tf_grid_size = self.get_parameter('initialize_tf_grid_size').get_parameter_value().double_value
         self.map_acquire_fps = self.get_parameter('map_acquire_fps').get_parameter_value().double_value
         self.publish_statistics_fps = self.get_parameter('publish_statistics_fps').get_parameter_value().double_value
@@ -210,6 +307,11 @@ class ElevationMappingNode(Node):
             plugin_config_file = self.get_parameter("plugin_config_file").get_parameter_value().string_value
             assert plugin_config_file
             self.param.plugin_config_file = plugin_config_file
+        if self.has_parameter("extra_plugin_config_file"):
+            # Optional: a second plugin config merged on top of plugin_config_file. Empty
+            # (default) disables it -- unlike plugin_config_file, no assert-non-empty here.
+            extra_plugin_config_file = self.get_parameter("extra_plugin_config_file").get_parameter_value().string_value
+            self.param.extra_plugin_config_file = extra_plugin_config_file
         if self.has_parameter("weight_file"):
             weight_file = self.get_parameter("weight_file").get_parameter_value().string_value
             assert weight_file
@@ -405,7 +507,14 @@ class ElevationMappingNode(Node):
         self._publishers_timers = []
 
         for pub_key, pub_config in self.my_publishers.items():
-            topic_name = f"/{self.get_name()}/{pub_key}"
+            # get_name() is just the base node name and does not include the
+            # namespace, so building the topic from it hardcodes an absolute
+            # topic that bypasses ROS2's namespace prefixing -- under
+            # namespace=<quad> this collided across robots (all quads
+            # published to the same /elevation_mapping_node/<pub_key>
+            # topic). get_fully_qualified_name() already includes the
+            # namespace and a leading slash.
+            topic_name = f"{self.get_fully_qualified_name()}/{pub_key}"
             publisher = self.create_publisher(GridMap, topic_name, 10)
             self._publishers_dict[pub_key] = publisher
 
@@ -415,6 +524,160 @@ class ElevationMappingNode(Node):
                 partial(self.publish_map, key=pub_key)
             )
             self._publishers_timers.append(timer)
+
+    def register_occupancy_publishers(self) -> None:
+        """Publish the tri-state occupancy classification and the Mighty-encoded ESDF as
+        nav_msgs/OccupancyGrid, for the geometric traversability pipeline (see
+        plugins/traversability_occupancy.py and plugins/traversability_esdf.py).
+
+        Topics are placed under this node's fully-qualified name (same reasoning as
+        register_publishers' GridMap topics: an unqualified name would collide across
+        multiple robots under namespace=<quad>), rather than at the bare root-level
+        `/traversability_occupancy` path the task spec names -- this repo's multi-robot
+        convention takes precedence; see the config file's header comment.
+        """
+        self._occupancy_publishers = {}
+        self._occupancy_timers = []
+        # Second occupancy output for MIGHTY planning, published in lock-step with the raw
+        # occ_2d_topic from the same publish_occupancy_grid() call (see below). None unless
+        # both the base occupancy publisher and the planning output are enabled.
+        self._planning_occupancy_publisher = None
+        if self.occupancy_grid_enable:
+            # Plain relative name -> ROS2 applies only this node's own namespace (e.g.
+            # /RR08/occ_2d_topic), matching how global_mapper_ros's occ_2d_pub_ and Mighty's
+            # sub_occ_2d_ both resolve it -- NOT nested under this node's own name.
+            topic_name = (
+                self.occupancy_grid_topic if self.occupancy_grid_root_relative
+                else f"{self.get_fully_qualified_name()}/{self.occupancy_grid_topic}"
+            )
+            publisher = self.create_publisher(OccupancyGrid, topic_name, 10)
+            self._occupancy_publishers[self.occupancy_grid_layer] = publisher
+            # Planning occupancy shares the SAME relative-name / namespace resolution as the
+            # raw occupancy topic (no hard-coded RR08) -> e.g. /RR08/planning_occ_2d_topic.
+            if self.planning_occupancy_grid_enable:
+                planning_topic_name = (
+                    self.planning_occupancy_grid_topic if self.occupancy_grid_root_relative
+                    else f"{self.get_fully_qualified_name()}/{self.planning_occupancy_grid_topic}"
+                )
+                self._planning_occupancy_publisher = self.create_publisher(
+                    OccupancyGrid, planning_topic_name, 10
+                )
+            timer = self.create_timer(
+                1.0 / self.occupancy_grid_fps,
+                partial(self.publish_occupancy_grid, layer_name=self.occupancy_grid_layer)
+            )
+            self._occupancy_timers.append(timer)
+        if self.esdf_grid_enable:
+            topic_name = (
+                self.esdf_grid_topic if self.esdf_grid_root_relative
+                else f"{self.get_fully_qualified_name()}/{self.esdf_grid_topic}"
+            )
+            publisher = self.create_publisher(OccupancyGrid, topic_name, 10)
+            self._occupancy_publishers[self.esdf_grid_layer] = publisher
+            timer = self.create_timer(
+                1.0 / self.esdf_grid_fps,
+                partial(self.publish_occupancy_grid, layer_name=self.esdf_grid_layer)
+            )
+            self._occupancy_timers.append(timer)
+
+    def publish_occupancy_grid(self, layer_name: str) -> None:
+        if self._map_q is None:
+            return
+        publisher = self._occupancy_publishers.get(layer_name)
+        # The planning grid is a derivative of the raw occupancy layer only, published from
+        # this same invocation. Whether we do the (cheap) extra work is decided per-publisher
+        # by subscriber count -- the two publishers are independent: the planning grid must
+        # still publish when it alone has a subscriber, and the raw grid must still publish
+        # when it alone has a subscriber. Neither depends on the other having subscribers.
+        planning_publisher = (
+            self._planning_occupancy_publisher
+            if layer_name == self.occupancy_grid_layer else None
+        )
+        raw_wanted = publisher is not None and publisher.get_subscription_count() > 0
+        planning_wanted = (
+            planning_publisher is not None and planning_publisher.get_subscription_count() > 0
+        )
+        if not raw_wanted and not planning_wanted:
+            return
+        try:
+            # TEMPORARY diagnostic instrumentation -- see initialize_elevation_mapping.
+            _diag_start = self._diag_time.perf_counter()
+            self._map.get_map_with_name_ref(layer_name, self._map_data)
+            self._diag_occ_times.append((layer_name, self._diag_time.perf_counter() - _diag_start))
+            if len(self._diag_occ_times) >= self._diag_log_every:
+                by_layer = {}
+                for name, dt in self._diag_occ_times:
+                    by_layer.setdefault(name, []).append(dt)
+                summary = " | ".join(
+                    f"{name}: n={len(v)} mean_ms={np.mean(v)*1000:.1f} max_ms={np.max(v)*1000:.1f}"
+                    for name, v in by_layer.items()
+                )
+                self.get_logger().info(f"[DIAG occ_grid] {summary}")
+                self._diag_occ_times.clear()
+        except KeyError:
+            # The source plugin layer doesn't exist (e.g. extra_plugin_config_file wasn't
+            # set, so the traversability pipeline was never loaded). Nothing to publish yet.
+            return
+
+        # get_map_with_name_ref (called above) unconditionally applies
+        # ElevationMap._transform_to_grid_map_coordinate_convention (transpose + flip both
+        # axes) to whatever it fetches -- that transform exists purely to match
+        # grid_map_msgs/GridMap's own storage convention (row/col -> -X/-Y, see
+        # elevation_mapping.py:798-843) and encode_layer_to_multiarray's own additional
+        # transpose. It is NOT the convention nav_msgs/OccupancyGrid wants.
+        #
+        # nav_msgs/OccupancyGrid expects plain row-major data with row=Y increasing and
+        # col=X increasing from info.origin (the bottom-left corner) -- which is exactly
+        # this repo's own *raw* internal convention (kernels/custom_kernels.py get_x_idx/
+        # get_y_idx: idx = (coord-center)/resolution + ..., no sign flip, row=Y, col=X).
+        # So: undo the grid_map transform get_map_with_name_ref applied, via its documented
+        # inverse (flip axis 0, flip axis 1, transpose -- see
+        # ElevationMap._transform_to_elevation_mapping_coordinate_convention), to get back
+        # to that raw convention before building the OccupancyGrid.
+        raw = np.flip(np.flip(self._map_data, 0), 1).T
+        data = np.round(raw).astype(np.int8)
+
+        center = self._get_map_center()
+        resolution = self._map.resolution
+        height, width = data.shape
+        actual_map_length_x = width * resolution
+        actual_map_length_y = height * resolution
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self._last_t if self._last_t is not None else self.get_clock().now().to_msg()
+        msg.info.resolution = float(resolution)
+        msg.info.width = int(width)
+        msg.info.height = int(height)
+        # nav_msgs/OccupancyGrid's origin is the pose of cell (0,0), i.e. the map's
+        # bottom-left corner, unlike grid_map_msgs/GridMap's info.pose (map center).
+        msg.info.origin.position.x = float(center[0]) - actual_map_length_x / 2.0
+        msg.info.origin.position.y = float(center[1]) - actual_map_length_y / 2.0
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        # Raw occupancy output (frontier detection) -- left EXACTLY as before. Publish only
+        # when it has a subscriber, preserving the original subscriber-gated behavior.
+        if raw_wanted:
+            msg.data = data.flatten().tolist()
+            publisher.publish(msg)
+
+        # Second occupancy output for MIGHTY HGP/A* planning. Derived from the identical
+        # occupancy update (same stamp/frame/resolution/size/origin) as the raw grid; only
+        # the cell values differ (large UNKNOWN components -> OCCUPIED). Recomputed fresh
+        # every call, no persistence. `data` (the raw array) is never mutated.
+        if planning_wanted:
+            planning_data = make_planning_occupancy_grid(
+                data,
+                self.planning_unknown_max_traversable_cells,
+                self.planning_unknown_exempt_border_components,
+            )
+            planning_msg = OccupancyGrid()
+            # Reuse the raw grid's header/info verbatim so the two outputs are byte-identical
+            # in stamp, frame_id, resolution, width/height, and origin.
+            planning_msg.header = msg.header
+            planning_msg.info = msg.info
+            planning_msg.data = planning_data.flatten().tolist()
+            planning_publisher.publish(planning_msg)
 
     def register_timers(self) -> None:
         self.time_pose_update = self.create_timer(
@@ -497,12 +760,16 @@ class ElevationMappingNode(Node):
         gm.layers = []
         gm.basic_layers = self.my_publishers[key]["basic_layers"]
 
-        for layer in self.my_publishers[key].get("layers", []):
-            gm.layers.append(layer)
-            self._map.get_map_with_name_ref(layer, self._map_data)
-            # After fixing CUDA kernels and removing flips in elevation_mapping.py, no flip needed here
-            map_data_for_gridmap = self._map_data
-            gm.data.append(self._numpy_to_multiarray(map_data_for_gridmap, layout="gridmap_column"))
+        # One lock acquisition across every layer (map_lock is an RLock, so nesting with
+        # get_map_with_name_ref's own acquisition is safe) so a message never mixes layers
+        # from two different generations.
+        with self._map.map_lock:
+            for layer in self.my_publishers[key].get("layers", []):
+                gm.layers.append(layer)
+                self._map.get_map_with_name_ref(layer, self._map_data)
+                # After fixing CUDA kernels and removing flips in elevation_mapping.py, no flip needed here
+                map_data_for_gridmap = self._map_data
+                gm.data.append(self._numpy_to_multiarray(map_data_for_gridmap, layout="gridmap_column"))
 
         gm.outer_start_index = 0
         gm.inner_start_index = 0
@@ -627,6 +894,67 @@ class ElevationMappingNode(Node):
             response.message = str(exc)
             self.get_logger().error(f"clear_map failed: {exc}")
         return response
+
+    # ---------------------------------------------------------------- DLIO session reset
+    def register_dlio_session_subscriber(self) -> None:
+        """Clear the map whenever DLIO restarts.
+
+        DLIO re-seeds its odom frame on every start, so everything this map holds in
+        <ns>/odom is stale afterwards: move_to only shifts it to the new pose and the
+        occupancy latch never decays. dlio_ws's scripts/dlio_session.py publishes a
+        per-launch token on <ns>/dlio/session (1 Hz, reliable, volatile); the first token
+        is recorded, a new one clears the map. Not routed through the clear_map service,
+        whose name comes from service_namespace and is not per-robot. The TF buffer is
+        left alone: clearing it would also drop /tf_static, which rmw_zenoh does not
+        re-deliver to late joiners. An empty dlio_session_topic disables this.
+        """
+        for name, default in (("dlio_session_topic", "dlio/session"), ("dlio_session_late_first_s", 5.0)):
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+        topic = self.get_parameter("dlio_session_topic").get_parameter_value().string_value
+        self._dlio_session = None
+        self._dlio_sessions_seen = set()
+        self._dlio_session_late_s = float(self.get_parameter("dlio_session_late_first_s").value)
+        self._dlio_session_t0 = time.monotonic()
+        if not topic:
+            self.get_logger().info("dlio_session_topic is empty: the map is not reset on DLIO restarts")
+            return
+        qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                         reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+        self._dlio_session_sub = self.create_subscription(String, topic, self._on_dlio_session, qos)
+        self.get_logger().info(f"clearing the map when {self._dlio_session_sub.topic_name} changes (DLIO restart)")
+
+    def _on_dlio_session(self, msg) -> None:
+        token = msg.data
+        if token == self._dlio_session:
+            return
+        if token in self._dlio_sessions_seen:
+            self.get_logger().warning(f"DLIO session {token[:90]} was seen before; ignoring it "
+                                      "(two DLIO session publishers?)", throttle_duration_sec=10.0)
+            return
+        first = self._dlio_session is None
+        waited = time.monotonic() - self._dlio_session_t0
+        prev, self._dlio_session = self._dlio_session, token
+        self._dlio_sessions_seen.add(token)
+        if first and waited <= self._dlio_session_late_s:
+            self.get_logger().info(f"first DLIO session recorded: {token[:90]}")
+            return
+        why = (f"DLIO restarted (session {prev[:90]} -> {token[:90]})" if not first else
+               f"first DLIO session arrived {waited:.0f} s after this node started, so DLIO restarted "
+               f"while it ran (session {token[:90]})")
+        self.get_logger().warning(f"{why}: clearing the elevation map, the odom frame was re-seeded")
+        self._clear_map_now(why)
+
+    def _clear_map_now(self, reason: str) -> bool:
+        """What handle_clear_map does, callable from a subscription."""
+        try:
+            self._map.clear()
+            self._last_t = self.get_clock().now().to_msg()
+            self._republish_all_once()
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"clearing the elevation map failed ({reason}): {exc}")
+            return False
 
     def _grid_map_to_numpy(self, grid_map_msg: GridMap):
         if len(grid_map_msg.layers) != len(grid_map_msg.data):
@@ -978,7 +1306,42 @@ class ElevationMappingNode(Node):
             raise ValueError("PointCloud2 header.frame_id is empty.")
 
         if frame_sensor_id == self.map_frame:
-            t_np = np.zeros(3, dtype=np.float32)
+            # The cloud is already expressed in the map frame (e.g. DLIO's deskewed cloud in
+            # odom), so no rotation/translation is needed to POSITION the points. But the
+            # fusion kernels' per-point noise model (point_noise), validity gate (is_valid)
+            # and visibility ray-casting all need the SENSOR's position, and they read it from
+            # `t`. Passing t=0 here (the old shortcut) made them treat the map/odom origin as
+            # the sensor, so measurement variance scaled as sensor_noise_factor * |p_odom|^2
+            # (distance from the odom origin) instead of true sensor range. Beyond
+            # ~sqrt(max_variance / sensor_noise_factor) that pushed every freshly-observed
+            # cell past max_variance, resetting it to unknown -- the map stopped populating
+            # once the robot drove far from where it started.
+            #
+            # Fix (no kernel changes): look up the sensor position in the map frame and make
+            # the point coords sensor-relative. With R=I and t=sensor_pos, transform_p
+            # reconstructs the original absolute position (rx + t = (p - sensor_pos) +
+            # sensor_pos = p), so cell placement is unchanged, while point_noise now sees the
+            # true range from the sensor and is_valid / ray-casting get the correct sensor
+            # origin. The sensor frame is configurable (sensor_frame param) -- set it to the
+            # lidar frame for exact range/height-above-sensor; it defaults to base_frame,
+            # which is off only by the lidar mounting offset. The odom-frame cloud's own
+            # header can't supply this (it's stamped in the map frame, not the sensor frame).
+            sensor_frame = self.sensor_frame if self.sensor_frame else self.base_frame
+            sensor_transform = self.safe_lookup_transform(
+                self.map_frame,
+                sensor_frame,
+                msg.header.stamp,
+            )
+            if sensor_transform is None:
+                # Sensor pose not available yet -- skip this cloud rather than fusing with a
+                # wrong (origin) sensor position.
+                return
+            st = sensor_transform.transform.translation
+            # float64 for the shift to avoid large-magnitude cancellation far from the origin,
+            # then back to float32 (the sensor-relative coords are small, ~0-50m).
+            sensor_pos = np.array([st.x, st.y, st.z], dtype=np.float64)
+            pts[:, :3] = (pts[:, :3].astype(np.float64) - sensor_pos).astype(np.float32)
+            t_np = sensor_pos.astype(np.float32)
             R = np.eye(3, dtype=np.float32)
         else:
             transform_sensor_to_map = self.safe_lookup_transform(
@@ -994,8 +1357,27 @@ class ElevationMappingNode(Node):
             t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
             R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
 
+        # TEMPORARY diagnostic instrumentation -- see initialize_elevation_mapping.
+        now = self._diag_time.perf_counter()
+        if self._diag_pc_last_arrival is not None:
+            self._diag_pc_gaps.append(now - self._diag_pc_last_arrival)
+        self._diag_pc_last_arrival = now
+
+        fusion_start = self._diag_time.perf_counter()
         self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
+        self._diag_pc_fusion_times.append(self._diag_time.perf_counter() - fusion_start)
         self._pointcloud_process_counter += 1
+
+        if len(self._diag_pc_fusion_times) >= self._diag_log_every:
+            fusion_arr = np.array(self._diag_pc_fusion_times)
+            gap_arr = np.array(self._diag_pc_gaps) if self._diag_pc_gaps else np.array([np.nan])
+            self.get_logger().info(
+                f"[DIAG pointcloud] n={len(fusion_arr)} fusion_ms mean={fusion_arr.mean()*1000:.1f} "
+                f"max={fusion_arr.max()*1000:.1f} | inter-arrival_ms mean={gap_arr.mean()*1000:.1f} "
+                f"max={gap_arr.max()*1000:.1f} (implied arrival Hz={1.0/gap_arr.mean():.2f})"
+            )
+            self._diag_pc_fusion_times.clear()
+            self._diag_pc_gaps.clear()
 
     def pose_update(self) -> None:
         if self._last_t is None:
@@ -1031,6 +1413,13 @@ class ElevationMappingNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = ElevationMappingNode()
+    # SingleThreadedExecutor: a MultiThreadedExecutor + split callback groups was tried
+    # here to decouple sensor ingestion from publish-timer callbacks, but made live latency
+    # dramatically worse in practice (likely lock-contention/thread-scheduling overhead on
+    # ElevationMap.map_lock outweighing any dispatch-level benefit) -- reverted. The
+    # vectorization/caching work in surface_normals.py/step_traversability.py/
+    # traversability_esdf.py already brought the full plugin chain down to ~1-50ms per
+    # cycle, which a single thread comfortably keeps up with at the configured rates.
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     try:

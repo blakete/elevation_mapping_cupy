@@ -33,6 +33,33 @@ class PluginBase(ABC):
             The parameter of callback
         """
 
+    def on_generation_bump(self, generation: int) -> None:
+        """Optional hook, called on every reset_layers() (i.e. every new point-cloud fusion
+        cycle or map shift) with the PluginManager's own authoritative generation counter.
+        Lets a plugin that would otherwise redundantly repeat identical expensive work across
+        multiple sibling instances (e.g. surface_normals.py's x/y/z components all needing the
+        same covariance/eigendecomposition) share a class-level cache keyed on this counter,
+        without guessing via content fingerprinting. No-op by default."""
+        pass
+
+    def on_map_clear(self) -> None:
+        """Optional hook, paired with on_map_shift: called by PluginManager.notify_clear
+        whenever the map is fully reset (ElevationMap.clear(), e.g. the clear_map service). A
+        stateful plugin should reset its own persistent arrays back to their initial/neutral
+        values here, matching the core elevation_map's own reset. No-op by default."""
+        pass
+
+    def on_map_shift(self, shift_value: "cp.ndarray") -> None:
+        """Optional hook for plugins that keep their own persistent state (e.g. an occupancy
+        confidence accumulator) across calls, rather than being purely a function of the
+        current elevation_map. Called by PluginManager.notify_shift whenever the underlying
+        map rolls (ElevationMap.shift_map_xy), with the same [row_shift, col_shift] cupy array
+        used to cp.roll the core elevation_map -- a stateful plugin must roll+pad its own
+        arrays identically to stay spatially aligned with the map it augments. No-op by
+        default; stateless plugins (the vast majority) never need to override this.
+        """
+        pass
+
     def __call__(
         self,
         elevation_map: cp.ndarray,
@@ -137,8 +164,21 @@ class PluginManager(object):
         self._layer_generations = [-1] * len(self.plugins)
         self._empty_semantic_map = cp.zeros((0, self.cell_n, self.cell_n), dtype=cp.float32)
 
-    def load_plugin_settings(self, file_path: str):
-        cfg = YAML().load(open(file_path, "r"))
+    def load_plugin_settings(self, file_path):
+        """Load plugin definitions from a YAML file, or merge several.
+
+        `file_path` is normally a single path (the pre-existing, single-file behaviour,
+        unchanged). It may also be a list of paths, in which case each file's top-level
+        entries are merged in order -- a later file's key overrides an earlier file's key of
+        the same name. This lets an independent pipeline (e.g. traversability estimation)
+        live in its own YAML file while sharing the same plugin loading/caching machinery.
+        """
+        paths = [file_path] if isinstance(file_path, str) else list(file_path)
+        cfg = {}
+        for path in paths:
+            if not path:
+                continue
+            cfg.update(YAML().load(open(path, "r")))
         plugin_params = []
         extra_params = []
         for k, v in cfg.items():
@@ -165,6 +205,25 @@ class PluginManager(object):
         """Invalidate cached plugin layers so they will be recomputed on demand."""
         if hasattr(self, "_generation"):
             self._generation += 1
+            for plugin in self.plugins:
+                # getattr fallback: PluginBase provides a no-op default, but a duck-typed
+                # plugin that doesn't inherit PluginBase (e.g. an ad-hoc test double) may not
+                # have this hook at all -- don't let that crash the whole update cycle.
+                getattr(plugin, "on_generation_bump", lambda generation: None)(self._generation)
+
+    def notify_shift(self, shift_value) -> None:
+        """Forward a map-roll event to every plugin's on_map_shift hook. Called by
+        ElevationMap.shift_map_xy alongside reset_layers -- stateless plugins ignore this
+        (default no-op base implementation); a plugin holding its own persistent array (see
+        PluginBase.on_map_shift) uses it to stay spatially aligned with the rolled map."""
+        for plugin in self.plugins:
+            getattr(plugin, "on_map_shift", lambda shift_value: None)(shift_value)
+
+    def notify_clear(self) -> None:
+        """Forward a full map-clear event to every plugin's on_map_clear hook. Called by
+        ElevationMap.clear()."""
+        for plugin in self.plugins:
+            getattr(plugin, "on_map_clear", lambda: None)()
 
     def get_plugin_names(self):
         names = []
@@ -218,15 +277,24 @@ class PluginManager(object):
                 raise RuntimeError(f"Cyclic plugin dependency detected while computing '{name}'")
             _active_stack.add(name)
             try:
+                # Single-dependency plugins (the pre-existing convention): one input_layer_name string.
                 input_layer_name = getattr(self.plugins[idx], "input_layer_name", None)
-                if input_layer_name in self.layer_names:
-                    dependency_idx = self.get_layer_index_with_name(input_layer_name)
+                dependencies = [input_layer_name] if input_layer_name else []
+                # Multi-dependency plugins (added for the traversability fusion/occupancy/ESDF chain,
+                # which each need several upstream layers computed fresh in the same cycle): an
+                # optional input_layer_names list. Backward compatible -- no existing plugin defines
+                # this attribute, so this branch is inert for all previously-existing plugins.
+                dependencies.extend(getattr(self.plugins[idx], "input_layer_names", []) or [])
+                for dependency_name in dependencies:
+                    if dependency_name not in self.layer_names:
+                        continue
+                    dependency_idx = self.get_layer_index_with_name(dependency_name)
                     if (
                         dependency_idx is not None
                         and self._layer_generations[dependency_idx] != self._generation
                     ):
                         self.update_with_name(
-                            input_layer_name,
+                            dependency_name,
                             elevation_map,
                             layer_names,
                             semantic_map=semantic_map,
