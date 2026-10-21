@@ -53,6 +53,16 @@ def get_filter_torch(*args, **kwargs):
     def _build(device):
         return TraversabilityFilter(*args, **kwargs).to(device).eval()
 
+    # A CPU-only torch (e.g. the Jazzy Orin container: NVIDIA publishes JetPack 6 CUDA torch
+    # wheels for Python 3.10 only, so on Python 3.12 the filter uses the pytorch.org CPU wheel)
+    # fails `.to("cuda")` with an AssertionError, not the RuntimeError caught below.
+    if not torch.cuda.is_available():
+        print(
+            "[elevation_mapping_cupy] torch has no CUDA (CPU-only build or no device) -- "
+            "running the traversability filter on CPU."
+        )
+        return _build("cpu")
+
     # Some GPUs (e.g. pre-Turing architectures such as sm_61/Pascal) have no
     # compiled kernels in a given torch build; this only surfaces as a
     # RuntimeError on the first real forward pass, not at construction or
